@@ -1,0 +1,18 @@
+# 基础与数据处理
+numpy
+gdown
+tqdm
+zarr<3.0.0
+
+# 深度学习与扩散模型
+torch
+diffusers
+accelerate
+
+# Push-T 机器人仿真环境
+gym
+pygame
+pymunk
+shapely
+opencv-python
+scikit-image
