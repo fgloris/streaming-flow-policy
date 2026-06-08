@@ -1,8 +1,20 @@
-# Standard imports
-import collections
-from dataclasses import dataclass
-import gdown
+"""
+Train Push-T policies from expr/.
+
+This script keeps the original Diffusion Policy training unchanged, and replaces
+expr's handwritten SFP training with the official implementations:
+  - streaming_flow_policy.pusht.sfps.StreamingFlowPolicyStochastic
+  - streaming_flow_policy.pusht.sfpd.StreamingFlowPolicyDeterministic
+
+Run examples:
+  python expr/pusht.py --policies diffusion sfps sfpd
+  python expr/pusht.py --policies sfps sfpd --num-epochs-flow 1000
+"""
+
+import argparse
 import os
+from pathlib import Path
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -16,268 +28,286 @@ from diffusers.optimization import get_scheduler
 from streaming_flow_policy.all import set_random_seed
 set_random_seed(0)
 
+# Keep the expr Diffusion Policy implementation unchanged.
 from utils import PushTDataset
-from model import *
+from model import ConditionalUnet1D as ExprConditionalUnet1D
 
-device = torch.device('cuda')
-
-# Download demonstration data from Google Drive
-#dataset_path = "pusht_cchi_v7_replay.zarr.zip"
-#if not os.path.isfile(dataset_path):
-#    id = "1KY1InLurpMvJDRb14L9NlXT_fEsCvVUq&confirm=t"
-#    gdown.download(id=id, output=dataset_path, quiet=False)
-
-# |o|o|                             observations: 2
-# | |a|a|a|a|a|a|a|a|               actions executed: 8
-# |p|p|p|p|p|p|p|p|p|p|p|p|p|p|p|p| actions predicted: 16
-
-obs_horizon = 2
-action_horizon = 8
-pred_horizon = 16
-
-# Create dataset from file
-dataset = PushTDataset(
-    dataset_path="pusht_cchi_v7_replay.zarr",
-    pred_horizon=pred_horizon,
-    obs_horizon=obs_horizon,
-    action_horizon=action_horizon,
-)
-# Save training data statistics (min, max) for each dim
-stats = dataset.stats
-
-# Create dataloader
-dataloader = torch.utils.data.DataLoader(
-    dataset,
-    batch_size=256,
-    num_workers=1,
-    shuffle=True,
-    pin_memory=True,  # accelerate cpu-gpu transfer
-    persistent_workers=True, # don't kill worker process after each epoch
-)
-
-# Visualize data in batch
-batch = next(iter(dataloader))
-print("batch['obs'].shape:", batch['obs'].shape)
-print("batch['action'].shape", batch['action'].shape)
-
-obs_horizon = 2
-obs_dim = 5
-action_dim = 2
-
-# ----------------- baseline: diffusion policy -------------------------
-# Create network object
-dp_noise_pred_net = ConditionalUnet1D(
-    input_dim=action_dim,
-    global_cond_dim=obs_dim*obs_horizon,
-    updownsample_type = 'Conv',
-    sin_embedding_scale = 1,  # original setting
-)
-
-num_diffusion_iters = 100
-noise_scheduler = DDPMScheduler(
-    num_train_timesteps=num_diffusion_iters,
-    # the choise of beta schedule has big impact on performance
-    # we found squared cosine works the best
-    beta_schedule='squaredcos_cap_v2',
-    # clip output to [-1,1] to improve stability
-    clip_sample=True,
-    # our network predicts noise (instead of denoised action)
-    prediction_type='epsilon'
-)
-# ------------------ streaming flow policy -----------------------------
-sfp_velocity_net = ConditionalUnet1D(
-    input_dim=action_dim,
-    global_cond_dim=obs_dim*obs_horizon,
-    # because SFP diffuses over a single action,
-    updownsample_type = 'Linear',
-    # because the original model assumes timesteps of the order of [0, 100]
-    # but SFP uses a time range of [0, 1]
-    sin_embedding_scale = 100,
-)
+# Use the official SFPS/SFPD implementations instead of expr's old handwritten SFP.
+from streaming_flow_policy.pusht.dataset import PushTStateDatasetWithNextObsAsAction
+from streaming_flow_policy.pusht.dp_state_notebook.network import ConditionalUnet1D as OfficialConditionalUnet1D
+from streaming_flow_policy.pusht.sfps import StreamingFlowPolicyStochastic
+from streaming_flow_policy.pusht.sfpd import StreamingFlowPolicyDeterministic
 
 
-import os
-checkpoint_dir = "ckpt"
-os.makedirs(checkpoint_dir, exist_ok=True)
+# -----------------------------------------------------------------------------
+# Shared Push-T settings
+# -----------------------------------------------------------------------------
+OBS_HORIZON = 2
+ACTION_HORIZON = 8
+PRED_HORIZON = 16
+OBS_DIM = 5
+ACTION_DIM = 2
 
-train_diffusion = True
-if train_diffusion:
-    num_epochs = 100
 
-    dp_noise_pred_net.to(device)
-    # Exponential Moving Average
-    # accelerates training and improves stability
-    # holds a copy of the model weights
-    ema_dp = EMAModel(
-        parameters=dp_noise_pred_net.parameters(),
-        power=0.75)
+class PushTStateDatasetWithNextObsAsActionFromPath(PushTStateDatasetWithNextObsAsAction):
+    """Official SFP dataset variant, but with an explicit local dataset path.
 
-    # Standard ADAM optimizer
-    # Note that EMA parametesr are not optimized
+    The official SFPS/SFPD training uses `PushTStateDatasetWithNextObsAsAction`,
+    where the action trajectory is the next gripper/state position.  This class
+    keeps that behavior while avoiding an implicit download path.
+    """
+
+    dataset_path = "pusht_cchi_v7_replay.zarr"
+
+    @staticmethod
+    def GetDatasetRoot():
+        import zarr
+        return zarr.open(PushTStateDatasetWithNextObsAsActionFromPath.dataset_path, "r")
+
+
+def build_dp_dataset(dataset_path: str) -> PushTDataset:
+    return PushTDataset(
+        dataset_path=dataset_path,
+        pred_horizon=PRED_HORIZON,
+        obs_horizon=OBS_HORIZON,
+        action_horizon=ACTION_HORIZON,
+    )
+
+
+def build_flow_dataset(dataset_path: str, policy):
+    PushTStateDatasetWithNextObsAsActionFromPath.dataset_path = dataset_path
+    return PushTStateDatasetWithNextObsAsActionFromPath(
+        pred_horizon=PRED_HORIZON,
+        obs_horizon=OBS_HORIZON,
+        action_horizon=ACTION_HORIZON,
+        transform_datum_fn=policy.TransformTrainingDatum,
+    )
+
+
+def make_dataloader(dataset, batch_size: int):
+    return torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=1,
+        shuffle=True,
+        pin_memory=True,
+        persistent_workers=True,
+    )
+
+
+def train_diffusion_policy(args, device: torch.device):
+    """Original expr diffusion training: architecture and scheduler settings kept."""
+    dataset = build_dp_dataset(args.dataset_path)
+    dataloader = make_dataloader(dataset, args.batch_size_dp)
+
+    batch = next(iter(dataloader))
+    print("[diffusion] batch['obs'].shape:", batch['obs'].shape)
+    print("[diffusion] batch['action'].shape", batch['action'].shape)
+
+    dp_noise_pred_net = ExprConditionalUnet1D(
+        input_dim=ACTION_DIM,
+        global_cond_dim=OBS_DIM * OBS_HORIZON,
+        updownsample_type="Conv",
+        sin_embedding_scale=1,
+    ).to(device)
+
+    num_diffusion_iters = 100
+    noise_scheduler = DDPMScheduler(
+        num_train_timesteps=num_diffusion_iters,
+        beta_schedule="squaredcos_cap_v2",
+        clip_sample=True,
+        prediction_type="epsilon",
+    )
+
+    ema_dp = EMAModel(parameters=dp_noise_pred_net.parameters(), power=0.75)
     optimizer = torch.optim.AdamW(
         params=dp_noise_pred_net.parameters(),
-        lr=1e-4, weight_decay=1e-6)
-
-    # Cosine LR schedule with linear warmup
-    lr_scheduler = get_scheduler(
-        name='cosine',
-        optimizer=optimizer,
-        num_warmup_steps=500,
-        num_training_steps=len(dataset) * num_epochs
+        lr=1e-4,
+        weight_decay=1e-6,
     )
 
-    with tqdm(range(num_epochs), desc='Epoch') as tglobal:
-        # epoch loop
-        for epoch_idx in tglobal:
-            epoch_loss = list()
-            # batch loop
-            with tqdm(dataloader, desc='Batch', leave=False) as tepoch:
+    # Kept from the original expr script.
+    lr_scheduler = get_scheduler(
+        name="cosine",
+        optimizer=optimizer,
+        num_warmup_steps=500,
+        num_training_steps=len(dataset) * args.num_epochs_dp,
+    )
+
+    with tqdm(range(args.num_epochs_dp), desc="Diffusion Epoch") as tglobal:
+        for _ in tglobal:
+            epoch_loss = []
+            with tqdm(dataloader, desc="Batch", leave=False) as tepoch:
                 for nbatch in tepoch:
-                    # Note that the data is normalized in the dataset.
-                    # Device transfer
-                    nobs = nbatch['obs'].to(device)  # (B, To, O)
-                    naction = nbatch['action'].to(device)  # (B, Tp, A)
+                    nobs = nbatch["obs"].to(device)
+                    naction = nbatch["action"].to(device)
                     B = nobs.shape[0]
 
-                    # Observation as FiLM conditioning
-                    obs_cond = nobs.flatten(start_dim=1)  # (B, To*O)
-
-                    # Sample noise to add to actions
-                    noise = torch.randn(naction.shape, device=device)  # (B, Tp, A)
-
-                    # sample a diffusion iteration for each data point
+                    obs_cond = nobs.flatten(start_dim=1)
+                    noise = torch.randn(naction.shape, device=device)
                     timesteps = torch.randint(
-                        0, noise_scheduler.config.num_train_timesteps,
-                        (B,), device=device
-                    ).long()  # (B,)
-
-                    # Forward diffusion process: Add noise to the clean images
-                    # according to the noise magnitude at each diffusion iteration.
-                    noisy_actions = noise_scheduler.add_noise(
-                        naction, noise, timesteps)  # (B, Tp, A)
-
-                    # Predict the noise residual.
-                    noise_pred = dp_noise_pred_net(
-                        noisy_actions, timesteps, global_cond=obs_cond)
-
-                    # L2 loss
+                        0,
+                        noise_scheduler.config.num_train_timesteps,
+                        (B,),
+                        device=device,
+                    ).long()
+                    noisy_actions = noise_scheduler.add_noise(naction, noise, timesteps)
+                    noise_pred = dp_noise_pred_net(noisy_actions, timesteps, global_cond=obs_cond)
                     loss = nn.functional.mse_loss(noise_pred, noise)
 
-                    # optimize
                     loss.backward()
                     optimizer.step()
                     optimizer.zero_grad()
-                    # step lr scheduler every batch
-                    # this is different from standard pytorch behavior
                     lr_scheduler.step()
-
-                    # update Exponential Moving Average of the model weights
                     ema_dp.step(dp_noise_pred_net.parameters())
 
-                    # logging
                     loss_cpu = loss.item()
                     epoch_loss.append(loss_cpu)
                     tepoch.set_postfix(loss=loss_cpu)
             tglobal.set_postfix(loss=np.mean(epoch_loss))
 
-    # Weights of the EMA model
-    # is used for inference
-    ema_noise_pred_net_dp = dp_noise_pred_net
-    ema_dp.copy_to(ema_noise_pred_net_dp.parameters())
+    ema_dp.copy_to(dp_noise_pred_net.parameters())
+    save_path = Path(args.checkpoint_dir) / "dp_noise_pred_net_ema.pth"
+    torch.save(dp_noise_pred_net.state_dict(), save_path)
+    print(f"[diffusion] saved EMA weights to: {save_path}")
 
-    # save state_dict
-    model_save_path = os.path.join(checkpoint_dir, "dp_noise_pred_net_ema.pth")
-    torch.save(ema_noise_pred_net_dp.state_dict(), model_save_path)
 
-    print(f"Diffusion policy 训练完成！ EMA 模型权重已成功保存至: {model_save_path}")
+def train_sfps(args, device: torch.device):
+    """Train official stochastic Streaming Flow Policy (streaming_flow_policy/pusht/sfps.py)."""
+    velocity_net = OfficialConditionalUnet1D(
+        input_dim=ACTION_DIM,
+        global_cond_dim=OBS_DIM * OBS_HORIZON,
+        fc_timesteps=2,
+    ).to(device)
 
-train_sfp = True
-if train_sfp:
-    σ0 = 0.4
-    k = 10
-    num_epochs = 100
-    
-    sfp_velocity_net.to(device)
-    # Exponential Moving Average
-    # accelerates training and improves stability
-    # holds a copy of the model weights
-    ema = EMAModel(
-        parameters=sfp_velocity_net.parameters(),
-        power=0.75)
+    policy = StreamingFlowPolicyStochastic(
+        velocity_net=velocity_net,
+        action_dim=ACTION_DIM,
+        pred_horizon=PRED_HORIZON,
+        σ0=args.sfps_sigma0,
+        σ1=args.sfps_sigma1,
+        device=device,
+    ).to(device)
 
-    # Standard ADAM optimizer
-    # Note that EMA parametesr are not optimized
-    optimizer = torch.optim.AdamW(
-        params=sfp_velocity_net.parameters(),
-        lr=1e-4, weight_decay=1e-6)
+    dataset = build_flow_dataset(args.dataset_path, policy)
+    dataloader = make_dataloader(dataset, args.batch_size_flow)
 
-    # Cosine LR schedule with linear warmup
+    ema = EMAModel(parameters=policy.velocity_net.parameters(), power=0.75)
+    optimizer = torch.optim.AdamW(policy.velocity_net.parameters(), lr=1e-4, weight_decay=1e-6)
     lr_scheduler = get_scheduler(
-        name='cosine',
+        name="cosine",
         optimizer=optimizer,
         num_warmup_steps=500,
-        num_training_steps=len(dataloader) * num_epochs
+        num_training_steps=len(dataloader) * args.num_epochs_flow,
     )
 
-    with tqdm(range(num_epochs), desc='Epoch') as tglobal:
-        # epoch loop
-        for epoch_idx in tglobal:
-            epoch_loss = list()
-            # batch loop
-            with tqdm(dataloader, desc='Batch', leave=False) as tepoch:
+    with tqdm(range(args.num_epochs_flow), desc="SFPS Epoch") as tglobal:
+        for _ in tglobal:
+            epoch_loss = []
+            with tqdm(dataloader, desc="Batch", leave=False) as tepoch:
                 for nbatch in tepoch:
-                    # Device transfer
-                    # Note that data is already normalized in the dataset.
-                    nobs = nbatch['obs'].to(device)  # (B, To, O)
-                    naction = nbatch['action'].to(device)  # (B, Tp, A)
-
-                    # SFP integrates actions starting from the current timestep.
-                    # But sequences extracted from the PushTDataset include actions
-                    # corresponding to the previous timesteps as well (Tp includes
-                    # To - 1 previous actions). The next line removes those.
-                    ξ = naction[:, obs_horizon-1:, :]  # (B, Tp - To + 1, A)
-
-                    # Sample t uniformly from [0, 1].
-                    t = torch.rand(ξ.shape[0]).float().to(device)  # (B,)
-
-                    ξt, dξdt = LinearlyInterpolateTrajectory(ξ, t)  # (B, A) and (B, A)
-                    a, v = SampleCFMInputsAndTargets(ξt, dξdt, t, k, σ0)  # (B, A) and (B, A)
-                    a, v = a.unsqueeze(1), v.unsqueeze(1)  # (B, 1, A) and (B, 1, A)
-                    
-                    # Conditional flow matching (CFM) loss: Mean-squared error
-                    # between predicted velocity and target velocity
-                    v̂t = sfp_velocity_net(
-                        sample=a,
-                        timestep=t,
-                        global_cond=nobs.flatten(start_dim=1),
-                    )  # (B, 1, A)
-                    loss = nn.functional.mse_loss(v, v̂t)  # (,) L2 loss
-
-                    # optimize
+                    loss = policy.Loss(nbatch)
                     loss.backward()
                     optimizer.step()
                     optimizer.zero_grad()
-                    # step lr scheduler every batch
-                    # this is different from standard pytorch behavior
                     lr_scheduler.step()
+                    ema.step(policy.velocity_net.parameters())
 
-                    # update Exponential Moving Average of the model weights
-                    ema.step(sfp_velocity_net.parameters())
-
-                    # logging
                     loss_cpu = loss.item()
                     epoch_loss.append(loss_cpu)
                     tepoch.set_postfix(loss=loss_cpu)
             tglobal.set_postfix(loss=np.mean(epoch_loss))
 
-    # Weights of the EMA model
-    # is used for inference
-    ema_spf_velocity_net = sfp_velocity_net
-    ema.copy_to(ema_spf_velocity_net.parameters())
+    ema.copy_to(policy.velocity_net.parameters())
+    save_path = Path(args.checkpoint_dir) / "pusht_sfps_obs_ema.pth"
+    torch.save(policy.state_dict(), save_path)
+    print(f"[sfps] saved EMA policy to: {save_path}")
 
-    # save state_dict
-    model_save_path = os.path.join(checkpoint_dir, "ema_spf_velocity_net_ema.pth")
-    torch.save(ema_spf_velocity_net.state_dict(), model_save_path)
 
-    print(f"Streaming Flow policy 训练完成！ EMA 模型权重已成功保存至: {model_save_path}")
+def train_sfpd(args, device: torch.device):
+    """Train official deterministic Streaming Flow Policy (streaming_flow_policy/pusht/sfpd.py)."""
+    velocity_net = OfficialConditionalUnet1D(
+        input_dim=ACTION_DIM,
+        global_cond_dim=OBS_DIM * OBS_HORIZON,
+        fc_timesteps=1,
+    ).to(device)
 
+    policy = StreamingFlowPolicyDeterministic(
+        velocity_net=velocity_net,
+        action_dim=ACTION_DIM,
+        pred_horizon=PRED_HORIZON,
+        sigma=args.sfpd_sigma,
+        device=device,
+    ).to(device)
+
+    dataset = build_flow_dataset(args.dataset_path, policy)
+    dataloader = make_dataloader(dataset, args.batch_size_flow)
+
+    ema = EMAModel(parameters=policy.velocity_net.parameters(), power=0.75)
+    optimizer = torch.optim.AdamW(policy.velocity_net.parameters(), lr=1e-4, weight_decay=1e-6)
+    lr_scheduler = get_scheduler(
+        name="cosine",
+        optimizer=optimizer,
+        num_warmup_steps=500,
+        num_training_steps=len(dataloader) * args.num_epochs_flow,
+    )
+
+    with tqdm(range(args.num_epochs_flow), desc="SFPD Epoch") as tglobal:
+        for _ in tglobal:
+            epoch_loss = []
+            with tqdm(dataloader, desc="Batch", leave=False) as tepoch:
+                for nbatch in tepoch:
+                    loss = policy.Loss(nbatch)
+                    loss.backward()
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    lr_scheduler.step()
+                    ema.step(policy.velocity_net.parameters())
+
+                    loss_cpu = loss.item()
+                    epoch_loss.append(loss_cpu)
+                    tepoch.set_postfix(loss=loss_cpu)
+            tglobal.set_postfix(loss=np.mean(epoch_loss))
+
+    ema.copy_to(policy.velocity_net.parameters())
+    save_path = Path(args.checkpoint_dir) / "pusht_sfpd_obs_ema.pth"
+    torch.save(policy.state_dict(), save_path)
+    print(f"[sfpd] saved EMA policy to: {save_path}")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset-path", default="pusht_cchi_v7_replay.zarr")
+    parser.add_argument("--checkpoint-dir", default="ckpt")
+    parser.add_argument(
+        "--policies",
+        nargs="+",
+        choices=("diffusion", "sfps", "sfpd"),
+        default=("diffusion", "sfps", "sfpd"),
+    )
+    parser.add_argument("--num-epochs-dp", type=int, default=100)
+    parser.add_argument("--num-epochs-flow", type=int, default=1000)
+    parser.add_argument("--batch-size-dp", type=int, default=256)
+    parser.add_argument("--batch-size-flow", type=int, default=1024)
+    parser.add_argument("--sfps-sigma0", type=float, default=0.1)
+    parser.add_argument("--sfps-sigma1", type=float, default=0.1)
+    parser.add_argument("--sfpd-sigma", type=float, default=0.1)
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    if "diffusion" in args.policies:
+        train_diffusion_policy(args, device)
+    if "sfps" in args.policies:
+        train_sfps(args, device)
+    if "sfpd" in args.policies:
+        train_sfpd(args, device)
+
+
+if __name__ == "__main__":
+    main()
