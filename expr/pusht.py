@@ -88,10 +88,10 @@ def make_dataloader(dataset, batch_size: int):
     return torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_size,
-        num_workers=1,
+        num_workers=0,
         shuffle=True,
-        pin_memory=True,
-        persistent_workers=True,
+        pin_memory=False,
+        persistent_workers=False,
     )
 
 
