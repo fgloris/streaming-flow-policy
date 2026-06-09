@@ -23,9 +23,6 @@ from model import ConditionalUnet1D as ExprConditionalUnet1D
 from utils import PushTEnv, PushTDataset, normalize_data, unnormalize_data
 
 from streaming_flow_policy.pusht.dataset import PushTStateDatasetWithNextObsAsAction
-from streaming_flow_policy.pusht.dp_state_notebook.network import ConditionalUnet1D as OfficialConditionalUnet1D
-from streaming_flow_policy.pusht.sfps import StreamingFlowPolicyStochastic
-from streaming_flow_policy.pusht.sfpd import StreamingFlowPolicyDeterministic
 
 
 OBS_HORIZON = 2
@@ -83,44 +80,6 @@ def load_diffusion_policy(ckpt_path: str, device: torch.device):
         prediction_type="epsilon",
     )
     return model, scheduler
-
-
-def load_sfps_policy(ckpt_path: str, device: torch.device, sigma0: float = 0.1, sigma1: float = 0.1):
-    velocity_net = OfficialConditionalUnet1D(
-        input_dim=ACTION_DIM,
-        global_cond_dim=OBS_DIM * OBS_HORIZON,
-        fc_timesteps=2,
-    )
-    policy = StreamingFlowPolicyStochastic(
-        velocity_net=velocity_net,
-        action_dim=ACTION_DIM,
-        pred_horizon=PRED_HORIZON,
-        σ0=sigma0,
-        σ1=sigma1,
-        device=device,
-    )
-    policy.load_state_dict(torch.load(ckpt_path, map_location=device))
-    policy.to(device).eval()
-    return policy
-
-
-def load_sfpd_policy(ckpt_path: str, device: torch.device, sigma: float = 0.1):
-    velocity_net = OfficialConditionalUnet1D(
-        input_dim=ACTION_DIM,
-        global_cond_dim=OBS_DIM * OBS_HORIZON,
-        fc_timesteps=1,
-    )
-    policy = StreamingFlowPolicyDeterministic(
-        velocity_net=velocity_net,
-        action_dim=ACTION_DIM,
-        pred_horizon=PRED_HORIZON,
-        sigma=sigma,
-        device=device,
-    )
-    policy.load_state_dict(torch.load(ckpt_path, map_location=device))
-    policy.to(device).eval()
-    return policy
-
 
 def rollout_diffusion(env, model, scheduler, stats, seed: int, max_steps: int, device: torch.device):
     env.seed(seed)
@@ -254,9 +213,6 @@ def parse_args():
     parser.add_argument("--max-steps", type=int, default=1000)
     parser.add_argument("--integration-steps-per-action", type=int, default=1)
     parser.add_argument("--output", default="policy_comparison_curve.png")
-    parser.add_argument("--sfps-sigma0", type=float, default=0.1)
-    parser.add_argument("--sfps-sigma1", type=float, default=0.1)
-    parser.add_argument("--sfpd-sigma", type=float, default=0.1)
     return parser.parse_args()
 
 
@@ -271,17 +227,6 @@ def main():
     flow_stats = build_flow_stats(args.dataset_path)
 
     dp_model, dp_scheduler = load_diffusion_policy(ckpt_dir / "dp_noise_pred_net_ema.pth", device)
-    sfps_policy = load_sfps_policy(
-        ckpt_dir / "pusht_sfps_obs_ema.pth",
-        device,
-        sigma0=args.sfps_sigma0,
-        sigma1=args.sfps_sigma1,
-    )
-    sfpd_policy = load_sfpd_policy(
-        ckpt_dir / "pusht_sfpd_obs_ema.pth",
-        device,
-        sigma=args.sfpd_sigma,
-    )
 
     results = []
     results.append(evaluate_policy(
@@ -290,18 +235,6 @@ def main():
         args.num_rollouts,
         args.max_steps,
     ))
-    #results.append(evaluate_policy(
-    #    "SFPS",
-    #    lambda env, seed, max_steps: rollout_flow(env, sfps_policy, flow_stats, seed, max_steps, device, args.integration_steps_per_action),
-    #    args.num_rollouts,
-    #    args.max_steps,
-    #))
-    #results.append(evaluate_policy(
-    #    "SFPD",
-    #    lambda env, seed, max_steps: rollout_flow(env, sfpd_policy, flow_stats, seed, max_steps, device, args.integration_steps_per_action),
-    #    args.num_rollouts,
-    #    args.max_steps,
-    #))
 
     print("\n=== Summary ===")
     for item in results:

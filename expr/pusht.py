@@ -34,10 +34,6 @@ from model import ConditionalUnet1D as ExprConditionalUnet1D
 
 # Use the official SFPS/SFPD implementations instead of expr's old handwritten SFP.
 from streaming_flow_policy.pusht.dataset import PushTStateDatasetWithNextObsAsAction
-from streaming_flow_policy.pusht.dp_state_notebook.network import ConditionalUnet1D as OfficialConditionalUnet1D
-from streaming_flow_policy.pusht.sfps import StreamingFlowPolicyStochastic
-from streaming_flow_policy.pusht.sfpd import StreamingFlowPolicyDeterministic
-
 
 # -----------------------------------------------------------------------------
 # Shared Push-T settings
@@ -172,109 +168,6 @@ def train_diffusion_policy(args, device: torch.device):
     print(f"[diffusion] saved EMA weights to: {save_path}")
 
 
-def train_sfps(args, device: torch.device):
-    """Train official stochastic Streaming Flow Policy (streaming_flow_policy/pusht/sfps.py)."""
-    velocity_net = OfficialConditionalUnet1D(
-        input_dim=ACTION_DIM,
-        global_cond_dim=OBS_DIM * OBS_HORIZON,
-        fc_timesteps=2,
-    ).to(device)
-
-    policy = StreamingFlowPolicyStochastic(
-        velocity_net=velocity_net,
-        action_dim=ACTION_DIM,
-        pred_horizon=PRED_HORIZON,
-        σ0=args.sfps_sigma0,
-        σ1=args.sfps_sigma1,
-        device=device,
-    ).to(device)
-
-    dataset = build_flow_dataset(args.dataset_path, policy)
-    dataloader = make_dataloader(dataset, args.batch_size_flow)
-
-    ema = EMAModel(parameters=policy.velocity_net.parameters(), power=0.75)
-    optimizer = torch.optim.AdamW(policy.velocity_net.parameters(), lr=1e-4, weight_decay=1e-6)
-    lr_scheduler = get_scheduler(
-        name="cosine",
-        optimizer=optimizer,
-        num_warmup_steps=500,
-        num_training_steps=len(dataloader) * args.num_epochs_flow,
-    )
-
-    with tqdm(range(args.num_epochs_flow), desc="SFPS Epoch") as tglobal:
-        for _ in tglobal:
-            epoch_loss = []
-            with tqdm(dataloader, desc="Batch", leave=False) as tepoch:
-                for nbatch in tepoch:
-                    loss = policy.Loss(nbatch)
-                    loss.backward()
-                    optimizer.step()
-                    optimizer.zero_grad()
-                    lr_scheduler.step()
-                    ema.step(policy.velocity_net.parameters())
-
-                    loss_cpu = loss.item()
-                    epoch_loss.append(loss_cpu)
-                    tepoch.set_postfix(loss=loss_cpu)
-            tglobal.set_postfix(loss=np.mean(epoch_loss))
-
-    ema.copy_to(policy.velocity_net.parameters())
-    save_path = Path(args.checkpoint_dir) / "pusht_sfps_obs_ema.pth"
-    torch.save(policy.state_dict(), save_path)
-    print(f"[sfps] saved EMA policy to: {save_path}")
-
-
-def train_sfpd(args, device: torch.device):
-    """Train official deterministic Streaming Flow Policy (streaming_flow_policy/pusht/sfpd.py)."""
-    velocity_net = OfficialConditionalUnet1D(
-        input_dim=ACTION_DIM,
-        global_cond_dim=OBS_DIM * OBS_HORIZON,
-        fc_timesteps=1,
-    ).to(device)
-
-    policy = StreamingFlowPolicyDeterministic(
-        velocity_net=velocity_net,
-        action_dim=ACTION_DIM,
-        pred_horizon=PRED_HORIZON,
-        sigma=args.sfpd_sigma,
-        device=device,
-    ).to(device)
-
-    dataset = build_flow_dataset(args.dataset_path, policy)
-    dataloader = make_dataloader(dataset, args.batch_size_flow)
-
-    ema = EMAModel(parameters=policy.velocity_net.parameters(), power=0.75)
-    optimizer = torch.optim.AdamW(policy.velocity_net.parameters(), lr=1e-4, weight_decay=1e-6)
-    lr_scheduler = get_scheduler(
-        name="cosine",
-        optimizer=optimizer,
-        num_warmup_steps=500,
-        num_training_steps=len(dataloader) * args.num_epochs_flow,
-    )
-
-    with tqdm(range(args.num_epochs_flow), desc="SFPD Epoch") as tglobal:
-        for _ in tglobal:
-            epoch_loss = []
-            with tqdm(dataloader, desc="Batch", leave=False) as tepoch:
-                for nbatch in tepoch:
-                    loss = policy.Loss(nbatch)
-                    loss.backward()
-                    optimizer.step()
-                    optimizer.zero_grad()
-                    lr_scheduler.step()
-                    ema.step(policy.velocity_net.parameters())
-
-                    loss_cpu = loss.item()
-                    epoch_loss.append(loss_cpu)
-                    tepoch.set_postfix(loss=loss_cpu)
-            tglobal.set_postfix(loss=np.mean(epoch_loss))
-
-    ema.copy_to(policy.velocity_net.parameters())
-    save_path = Path(args.checkpoint_dir) / "pusht_sfpd_obs_ema.pth"
-    torch.save(policy.state_dict(), save_path)
-    print(f"[sfpd] saved EMA policy to: {save_path}")
-
-
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset-path", default="pusht_cchi_v7_replay.zarr")
@@ -282,16 +175,11 @@ def parse_args():
     parser.add_argument(
         "--policies",
         nargs="+",
-        choices=("diffusion", "sfps", "sfpd"),
-        default=("diffusion", "sfps", "sfpd"),
+        choices=("diffusion"),
+        default=("diffusion"),
     )
     parser.add_argument("--num-epochs-dp", type=int, default=100)
-    parser.add_argument("--num-epochs-flow", type=int, default=1000)
     parser.add_argument("--batch-size-dp", type=int, default=256)
-    parser.add_argument("--batch-size-flow", type=int, default=1024)
-    parser.add_argument("--sfps-sigma0", type=float, default=0.1)
-    parser.add_argument("--sfps-sigma1", type=float, default=0.1)
-    parser.add_argument("--sfpd-sigma", type=float, default=0.1)
     return parser.parse_args()
 
 
@@ -303,11 +191,6 @@ def main():
 
     if "diffusion" in args.policies:
         train_diffusion_policy(args, device)
-    if "sfps" in args.policies:
-        train_sfps(args, device)
-    if "sfpd" in args.policies:
-        train_sfpd(args, device)
-
 
 if __name__ == "__main__":
     main()
